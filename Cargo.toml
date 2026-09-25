@@ -1,0 +1,8 @@
+[package]
+name = "dependent-optics"
+version = "0.1.0"
+edition = "2021"
+description = "Dependent optics (Vertechi, arXiv:2204.09547)"
+license = "MIT"
+
+[dependencies]
