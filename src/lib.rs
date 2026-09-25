@@ -15,12 +15,19 @@
 //! - [`ad`] — reverse-mode differentiation with an explicit residual (Section 3.1)
 //! - [`kernel`] — MLP, ResNet, and transformer blocks compiled to NVIDIA kernels
 //! - [`mixtral`] — Mixtral 8x7B (sliding-window GQA, RoPE, RMSNorm, top-2 SwiGLU experts) compiled for SGD
+//! - [`cluster`] — stages parameter buffers and tapes onto CPUs and GPUs under code and buffer budgets
+//!
+//! A compiled model is a schedule: kernel text in code memory, and parameters,
+//! adjoints, residuals, and scratch in buffer memory. Each launch names the
+//! slices it reads and writes. A cluster assigns those slices to devices, and
+//! the Mixtral emitter runs that assignment.
 //! - [`vect`] — finite-dimensional vector spaces over `GF(2)`, shared by the linear examples
 
 pub mod ad;
 pub mod bicat_optic;
 pub mod bimod;
 pub mod closed;
+pub mod cluster;
 pub mod comonoid;
 pub mod dlens;
 pub mod dprism;

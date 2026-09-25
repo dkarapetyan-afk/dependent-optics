@@ -12,6 +12,15 @@
 //! are the three architectures. [`emit_cuda`] lowers a program to CUDA. The
 //! forward kernels are the maps `X → M × Y` and the backward kernels are the
 //! maps `M × dY → dX`.
+//!
+//! The compiled program is a schedule. Kernel text is code memory. The
+//! parameter buffer, its adjoint, the residual tape, the skip side buffer, and
+//! the activation scratch are buffer memory. Each launch binds one kernel to
+//! slices of those buffers. Lengths and offsets are `u64`. A launch whose
+//! element count exceeds `2^31 - 1` blocks of 128 threads is split into
+//! chunks, and each chunk carries a 64-bit base index. [`emit_cuda`] specializes
+//! this schedule into one translation unit and copies the supplied weights in
+//! so the binary can check itself.
 
 /// One compiled stage. Offsets are into the flat residual tape.
 #[derive(Clone, Debug, PartialEq)]
@@ -93,10 +102,6 @@ impl Built {
     }
 
     fn attention(&mut self, batch: usize, tokens: usize, dim: usize) -> usize {
-        assert!(
-            tokens <= 64,
-            "the attention kernel keeps one row in registers"
-        );
         let x_at = self.prog.tape_f32;
         let n = batch * tokens * dim;
         self.prog.tape_f32 += n;
@@ -504,35 +509,31 @@ pub fn emit_cuda(
                 kernels.push_str(&gemm_kernels(idx));
                 let mut step = String::new();
                 fwd.push_str(&format!(
-                    "    cudaMemcpy(dtape + {save_at}, {src}, {n} * sizeof(float), cudaMemcpyDeviceToDevice);\n",
+                    "    cudaMemcpy(dtape + {save_at}ull, {src}, {n}ull * sizeof(float), cudaMemcpyDeviceToDevice);\n",
                     n = batch * din,
                 ));
                 fwd.push_str(&format!(
-                    "    fwd_gemm_{idx}<<<grid({out}), 128>>>({src}, dparams + {param_at}, dparams + {bias}, {dst}, dmask + {mask_at}, {batch}, {din}, {dout}, {relu});\n",
-                    out = batch * dout,
+                    "    CHUNKED({batch}ull * {dout}ull, fwd_gemm_{idx}<<<blocks_for(count), 128>>>({src}, dparams + {param_at}ull, dparams + {bias}ull, {dst}, dmask + {mask_at}ull, {din}ull, {dout}ull, {relu}, base + count, base));\n",
                     bias = param_at + din * dout,
                     relu = relu as i32,
                 ));
                 step.push_str(&format!(
-                    "    if ({relu}) bwd_relu_{idx}<<<grid({out}), 128>>>(ddy, dmask + {mask_at}, {out});\n",
+                    "    if ({relu}) CHUNKED({out}ull, bwd_relu_{idx}<<<blocks_for(count), 128>>>(ddy, dmask + {mask_at}ull, base + count, base));\n",
                     out = batch * dout,
                     relu = relu as i32,
                 ));
                 step.push_str(&format!(
-                    "    bwd_dx_{idx}<<<grid({xin}), 128>>>(ddy, dparams + {param_at}, ddx_tmp, {batch}, {din}, {dout});\n",
-                    xin = batch * din,
+                    "    CHUNKED({batch}ull * {din}ull, bwd_dx_{idx}<<<blocks_for(count), 128>>>(ddy, dparams + {param_at}ull, ddx_tmp, {din}ull, {dout}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
-                    "    bwd_dw_{idx}<<<grid({wn}), 128>>>(dtape + {save_at}, ddy, ddp + {param_at}, {batch}, {din}, {dout});\n",
-                    wn = din * dout,
+                    "    CHUNKED({din}ull * {dout}ull, bwd_dw_{idx}<<<blocks_for(count), 128>>>(dtape + {save_at}ull, ddy, ddp + {param_at}ull, {batch}ull, {din}ull, {dout}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
-                    "    bwd_db_{idx}<<<grid({dout}), 128>>>(ddy, ddp + {bias}, {batch}, {dout});\n",
+                    "    CHUNKED({dout}ull, bwd_db_{idx}<<<blocks_for(count), 128>>>(ddy, ddp + {bias}ull, {batch}ull, {dout}ull, base + count, base));\n",
                     bias = param_at + din * dout,
                 ));
                 step.push_str(&format!(
-                    "    add_skip_{idx}<<<grid({xin}), 128>>>(ddx_tmp, dside + {save_at}, {xin});\n",
-                    xin = batch * din,
+                    "    CHUNKED({batch}ull * {din}ull, add_skip_{idx}<<<blocks_for(count), 128>>>(ddx_tmp, dside + {save_at}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
                     "    cudaMemcpy(ddy, ddx_tmp, {xin} * sizeof(float), cudaMemcpyDeviceToDevice);\n",
@@ -554,17 +555,16 @@ pub fn emit_cuda(
                 kernels.push_str(&attention_kernels(idx));
                 let mut step = String::new();
                 fwd.push_str(&format!(
-                    "    cudaMemcpy(dtape + {x_at}, {src}, {n} * sizeof(float), cudaMemcpyDeviceToDevice);\n",
+                    "    cudaMemcpy(dtape + {x_at}ull, {src}, {n}ull * sizeof(float), cudaMemcpyDeviceToDevice);\n",
                 ));
                 fwd.push_str(&format!(
-                    "    fwd_attn_{idx}<<<grid({rows}), 128>>>({src}, dtape + {probs_at}, {dst}, {batch}, {tokens}, {dim});\n",
-                    rows = batch * tokens,
+                    "    CHUNKED({batch}ull * {tokens}ull, fwd_attn_{idx}<<<blocks_for(count), 128>>>({src}, dtape + {probs_at}ull, {dst}, {batch}ull, {tokens}ull, {dim}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
-                    "    bwd_attn_{idx}<<<grid({n}), 128>>>(dtape + {x_at}, dtape + {probs_at}, ddy, ddx_tmp, {batch}, {tokens}, {dim});\n",
+                    "    CHUNKED({n}ull, bwd_attn_{idx}<<<blocks_for(count), 128>>>(dtape + {x_at}ull, dtape + {probs_at}ull, ddy, ddx_tmp, {batch}ull, {tokens}ull, {dim}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
-                    "    add_skip_{idx}<<<grid({n}), 128>>>(ddx_tmp, dside + {x_at}, {n});\n",
+                    "    CHUNKED({n}ull, add_skip_{idx}<<<blocks_for(count), 128>>>(ddx_tmp, dside + {x_at}ull, base + count, base));\n",
                 ));
                 step.push_str(&format!(
                     "    cudaMemcpy(ddy, ddx_tmp, {n} * sizeof(float), cudaMemcpyDeviceToDevice);\n",
@@ -576,10 +576,10 @@ pub fn emit_cuda(
                 let cur = if cur_is_buf1 { "buf1" } else { "buf0" };
                 kernels.push_str(&add_kernel(idx));
                 fwd.push_str(&format!(
-                    "    add_fwd_{idx}<<<grid({len}), 128>>>({cur}, dtape + {from}, {len});\n",
+                    "    CHUNKED({len}ull, add_fwd_{idx}<<<blocks_for(count), 128>>>({cur}, dtape + {from}ull, base + count, base));\n",
                 ));
                 bwd_steps.push(format!(
-                    "    add_fwd_{idx}<<<grid({len}), 128>>>(dside + {from}, ddy, {len});\n",
+                    "    CHUNKED({len}ull, add_fwd_{idx}<<<blocks_for(count), 128>>>(dside + {from}ull, ddy, base + count, base));\n",
                 ));
             }
         }
@@ -595,20 +595,35 @@ pub fn emit_cuda(
 }
 
 fn grid_helper() -> &'static str {
-    "int grid(int n) { return (n + 127) / 128; }\n"
+    r#"
+using ull = unsigned long long;
+int blocks_for(ull count) {
+    ull b = (count + 127ull) / 128ull;
+    return b == 0 ? 1 : (int)b;
+}
+#define CHUNKED(n, ...) do { \
+    const ull _n = (ull)(n); \
+    const ull _chunk = 2147483647ull * 128ull; \
+    for (ull base = 0; _n > 0 && base < _n; base += _chunk) { \
+        ull count = _n - base; \
+        if (count > _chunk) count = _chunk; \
+        __VA_ARGS__; \
+    } \
+} while (0)
+"#
 }
 
 fn gemm_kernels(idx: usize) -> String {
     format!(
         r#"
 __global__ void fwd_gemm_{idx}(const float* X, const float* W, const float* bias, float* Y, unsigned char* mask,
-                                int B, int Din, int Dout, int relu) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * Dout) return;
-    int m = idx / Dout;
-    int n = idx - m * Dout;
+                                ull Din, ull Dout, int relu, ull limit, ull base) {{
+    ull idx = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= limit) return;
+    ull m = idx / Dout;
+    ull n = idx - m * Dout;
     float acc = bias[n];
-    for (int k = 0; k < Din; ++k) acc += X[m * Din + k] * W[k * Dout + n];
+    for (ull k = 0; k < Din; ++k) acc += X[m * Din + k] * W[k * Dout + n];
     if (relu) {{
         mask[idx] = acc > 0.f ? 1 : 0;
         Y[idx] = acc > 0.f ? acc : 0.f;
@@ -616,38 +631,38 @@ __global__ void fwd_gemm_{idx}(const float* X, const float* W, const float* bias
         Y[idx] = acc;
     }}
 }}
-__global__ void bwd_relu_{idx}(float* dY, const unsigned char* mask, int n) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n && mask[i] == 0) dY[i] = 0.f;
+__global__ void bwd_relu_{idx}(float* dY, const unsigned char* mask, ull limit, ull base) {{
+    ull i = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < limit && mask[i] == 0) dY[i] = 0.f;
 }}
-__global__ void bwd_dx_{idx}(const float* dY, const float* W, float* dX, int B, int Din, int Dout) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * Din) return;
-    int m = idx / Din;
-    int k = idx - m * Din;
+__global__ void bwd_dx_{idx}(const float* dY, const float* W, float* dX, ull Din, ull Dout, ull limit, ull base) {{
+    ull idx = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= limit) return;
+    ull m = idx / Din;
+    ull k = idx - m * Din;
     float acc = 0.f;
-    for (int n = 0; n < Dout; ++n) acc += dY[m * Dout + n] * W[k * Dout + n];
+    for (ull n = 0; n < Dout; ++n) acc += dY[m * Dout + n] * W[k * Dout + n];
     dX[idx] = acc;
 }}
-__global__ void bwd_dw_{idx}(const float* X, const float* dY, float* dW, int B, int Din, int Dout) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= Din * Dout) return;
-    int k = idx / Dout;
-    int n = idx - k * Dout;
+__global__ void bwd_dw_{idx}(const float* X, const float* dY, float* dW, ull B, ull Din, ull Dout, ull limit, ull base) {{
+    ull idx = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= limit) return;
+    ull k = idx / Dout;
+    ull n = idx - k * Dout;
     float acc = 0.f;
-    for (int m = 0; m < B; ++m) acc += X[m * Din + k] * dY[m * Dout + n];
+    for (ull m = 0; m < B; ++m) acc += X[m * Din + k] * dY[m * Dout + n];
     dW[idx] = acc;
 }}
-__global__ void bwd_db_{idx}(const float* dY, float* db, int B, int Dout) {{
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= Dout) return;
+__global__ void bwd_db_{idx}(const float* dY, float* db, ull B, ull Dout, ull limit, ull base) {{
+    ull n = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= limit) return;
     float acc = 0.f;
-    for (int m = 0; m < B; ++m) acc += dY[m * Dout + n];
+    for (ull m = 0; m < B; ++m) acc += dY[m * Dout + n];
     db[n] = acc;
 }}
-__global__ void add_skip_{idx}(float* dx, const float* extra, int n) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dx[i] += extra[i];
+__global__ void add_skip_{idx}(float* dx, const float* extra, ull limit, ull base) {{
+    ull i = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < limit) dx[i] += extra[i];
 }}
 "#
     )
@@ -656,9 +671,9 @@ __global__ void add_skip_{idx}(float* dx, const float* extra, int n) {{
 fn add_kernel(idx: usize) -> String {
     format!(
         r#"
-__global__ void add_fwd_{idx}(float* y, const float* extra, int n) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] += extra[i];
+__global__ void add_fwd_{idx}(float* y, const float* extra, ull limit, ull base) {{
+    ull i = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < limit) y[i] += extra[i];
 }}
 "#
     )
@@ -667,57 +682,60 @@ __global__ void add_fwd_{idx}(float* y, const float* extra, int n) {{
 fn attention_kernels(idx: usize) -> String {
     format!(
         r#"
-__global__ void fwd_attn_{idx}(const float* X, float* probs, float* Y, int B, int T, int D) {{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= B * T) return;
-    int b = row / T;
-    int i = row - b * T;
+__global__ void fwd_attn_{idx}(const float* X, float* probs, float* Y, ull B, ull T, ull D, ull limit, ull base) {{
+    ull row = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= limit) return;
+    ull b = row / T;
+    ull i = row - b * T;
     float scale = rsqrtf((float)D);
-    float row_s[64];
     float max_s = -1e30f;
-    for (int j = 0; j < T; ++j) {{
+    for (ull j = 0; j < T; ++j) {{
         float dot = 0.f;
-        for (int d = 0; d < D; ++d)
+        for (ull d = 0; d < D; ++d)
             dot += X[(b * T + i) * D + d] * X[(b * T + j) * D + d];
-        row_s[j] = dot * scale;
-        max_s = fmaxf(max_s, row_s[j]);
+        max_s = fmaxf(max_s, dot * scale);
     }}
     float sum = 0.f;
-    for (int j = 0; j < T; ++j) {{
-        row_s[j] = expf(row_s[j] - max_s);
-        sum += row_s[j];
+    for (ull j = 0; j < T; ++j) {{
+        float dot = 0.f;
+        for (ull d = 0; d < D; ++d)
+            dot += X[(b * T + i) * D + d] * X[(b * T + j) * D + d];
+        sum += expf(dot * scale - max_s);
     }}
-    for (int j = 0; j < T; ++j) {{
-        row_s[j] /= sum;
-        probs[(b * T + i) * T + j] = row_s[j];
+    for (ull j = 0; j < T; ++j) {{
+        float dot = 0.f;
+        for (ull d = 0; d < D; ++d)
+            dot += X[(b * T + i) * D + d] * X[(b * T + j) * D + d];
+        probs[(b * T + i) * T + j] = expf(dot * scale - max_s) / sum;
     }}
-    for (int d = 0; d < D; ++d) {{
+    for (ull d = 0; d < D; ++d) {{
         float acc = 0.f;
-        for (int j = 0; j < T; ++j) acc += row_s[j] * X[(b * T + j) * D + d];
+        for (ull j = 0; j < T; ++j) acc += probs[(b * T + i) * T + j] * X[(b * T + j) * D + d];
         Y[(b * T + i) * D + d] = acc;
     }}
+    (void)B;
 }}
 __global__ void bwd_attn_{idx}(const float* X, const float* probs, const float* dY, float* dX,
-                                int B, int T, int D) {{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = B * T * D;
-    if (idx >= n) return;
-    int tmp = idx;
-    int d = tmp % D; tmp /= D;
-    int t = tmp % T; tmp /= T;
-    int b = tmp;
+                                ull B, ull T, ull D, ull limit, ull base) {{
+    ull idx = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= limit) return;
+    ull d = idx % D;
+    ull tmp = idx / D;
+    ull t = tmp % T;
+    tmp /= T;
+    ull b = tmp;
     float scale = rsqrtf((float)D);
     float dv = 0.f, dq = 0.f, dk = 0.f;
-    for (int i = 0; i < T; ++i) {{
+    for (ull i = 0; i < T; ++i) {{
         float p = probs[(b * T + i) * T + t];
         dv += p * dY[(b * T + i) * D + d];
     }}
-    for (int j = 0; j < T; ++j) {{
+    for (ull j = 0; j < T; ++j) {{
         float dot_da = 0.f;
         float mean = 0.f;
-        for (int k = 0; k < T; ++k) {{
+        for (ull k = 0; k < T; ++k) {{
             float dak = 0.f;
-            for (int e = 0; e < D; ++e)
+            for (ull e = 0; e < D; ++e)
                 dak += dY[(b * T + t) * D + e] * X[(b * T + k) * D + e];
             float pk = probs[(b * T + t) * T + k];
             mean += pk * dak;
@@ -727,12 +745,12 @@ __global__ void bwd_attn_{idx}(const float* X, const float* probs, const float* 
         float ds = p * (dot_da - mean) * scale;
         dq += ds * X[(b * T + j) * D + d];
     }}
-    for (int i = 0; i < T; ++i) {{
+    for (ull i = 0; i < T; ++i) {{
         float dot_da = 0.f;
         float mean = 0.f;
-        for (int k = 0; k < T; ++k) {{
+        for (ull k = 0; k < T; ++k) {{
             float dak = 0.f;
-            for (int e = 0; e < D; ++e)
+            for (ull e = 0; e < D; ++e)
                 dak += dY[(b * T + i) * D + e] * X[(b * T + k) * D + e];
             float pk = probs[(b * T + i) * T + k];
             mean += pk * dak;
@@ -743,10 +761,11 @@ __global__ void bwd_attn_{idx}(const float* X, const float* probs, const float* 
         dk += ds * X[(b * T + i) * D + d];
     }}
     dX[(b * T + t) * D + d] = dv + dq + dk;
+    (void)B;
 }}
-__global__ void add_skip_{idx}(float* dx, const float* extra, int n) {{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dx[i] += extra[i];
+__global__ void add_skip_{idx}(float* dx, const float* extra, ull limit, ull base) {{
+    ull i = base + (ull)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < limit) dx[i] += extra[i];
 }}
 "#
     )
@@ -797,12 +816,12 @@ fn source_template(
 {kernels}
 static int fail(const char* msg) {{ printf("FAIL %s\n", msg); return 1; }}
 int main() {{
-    const int in_len = {in_len};
-    const int out_len = {out_len};
-    const int param_len = {param_len};
-    const int tape_f32 = {tape_f32};
-    const int tape_u8 = {tape_u8};
-    const int max_activ = {max_activ};
+    const ull in_len = {in_len}ull;
+    const ull out_len = {out_len}ull;
+    const ull param_len = {param_len}ull;
+    const ull tape_f32 = {tape_f32}ull;
+    const ull tape_u8 = {tape_u8}ull;
+    const ull max_activ = {max_activ}ull;
     const size_t in_bytes = in_len * sizeof(float);
     const size_t out_bytes = out_len * sizeof(float);
     const size_t param_bytes = param_len * sizeof(float);
@@ -836,14 +855,14 @@ int main() {{
     cudaError_t err = cudaDeviceSynchronize();
     if (err) return fail(cudaGetErrorString(err));
     auto close = [](float a, float b) {{ return fabsf(a - b) <= 1e-3f + 1e-3f * fabsf(b); }};
-    for (int i = 0; i < out_len; ++i) if (!close(y[i], h_ey[i])) {{
-        printf("FAIL y[%d] gpu %g cpu %g\n", i, y[i], h_ey[i]); return 1;
+    for (ull i = 0; i < out_len; ++i) if (!close(y[i], h_ey[i])) {{
+        printf("FAIL y[%llu] gpu %g cpu %g\n", i, y[i], h_ey[i]); return 1;
     }}
-    for (int i = 0; i < in_len; ++i) if (!close(dx[i], h_edx[i])) {{
-        printf("FAIL dx[%d] gpu %g cpu %g\n", i, dx[i], h_edx[i]); return 1;
+    for (ull i = 0; i < in_len; ++i) if (!close(dx[i], h_edx[i])) {{
+        printf("FAIL dx[%llu] gpu %g cpu %g\n", i, dx[i], h_edx[i]); return 1;
     }}
-    for (int i = 0; i < param_len; ++i) if (!close(dp[i], h_edp[i])) {{
-        printf("FAIL dp[%d] gpu %g cpu %g\n", i, dp[i], h_edp[i]); return 1;
+    for (ull i = 0; i < param_len; ++i) if (!close(dp[i], h_edp[i])) {{
+        printf("FAIL dp[%llu] gpu %g cpu %g\n", i, dp[i], h_edp[i]); return 1;
     }}
     printf("OK {name}\n");
     return 0;
@@ -877,8 +896,7 @@ int main() {{
     )
 }
 
-/// Compile `src` with nvcc and run it. Returns the compiler/runtime output.
-pub fn nvcc_run(src: &str, name: &str) -> Result<String, String> {
+fn nvcc_compile_bin(src: &str, name: &str) -> Result<std::path::PathBuf, String> {
     let dir = std::env::temp_dir();
     let cu = dir.join(format!("{name}.cu"));
     let bin = dir.join(name);
@@ -902,6 +920,17 @@ pub fn nvcc_run(src: &str, name: &str) -> Result<String, String> {
             String::from_utf8_lossy(&compile.stderr)
         ));
     }
+    Ok(bin)
+}
+
+/// Compile `src` with nvcc. The binary is not run.
+pub fn nvcc_compile(src: &str, name: &str) -> Result<(), String> {
+    nvcc_compile_bin(src, name).map(|_| ())
+}
+
+/// Compile `src` with nvcc and run it. Returns the compiler/runtime output.
+pub fn nvcc_run(src: &str, name: &str) -> Result<String, String> {
+    let bin = nvcc_compile_bin(src, name)?;
     let run = std::process::Command::new(&bin)
         .output()
         .map_err(|e| e.to_string())?;

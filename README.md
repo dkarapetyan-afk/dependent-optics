@@ -234,7 +234,7 @@ Cotangents agree with forward-mode dual numbers `Q[ε]/ε²` on a fixed catalogu
 
 ## Kernels
 
-`kernel` is how an existing architecture becomes a dependent lens whose two passes are NVIDIA kernels.
+`kernel` is how an existing architecture becomes a dependent lens whose two passes are NVIDIA kernels. The memory those kernels run against is specified in [Compiler specification](#compiler-specification).
 
 A stage is one lens `X → M × Y`:
 
@@ -252,7 +252,7 @@ The three constructors:
 
 * `Program::mlp(batch, dims)` — linear layers, ReLU between them and not after the last. For `mlp(2, &[3, 4, 2])` the tape is `2*3 + 2*4` floats and `2*4` mask bytes, and the parameter buffer has length `3*4 + 4 + 4*2 + 2`.
 * `Program::resnet_block(batch, dim, hidden)` — `x + W₂ relu(W₁ x + b₁) + b₂`. The first GEMM saves `x`. The add’s `from` is that offset.
-* `Program::transformer_block(batch, tokens, dim, mlp_hidden)` — residual self-attention, then a residual MLP of width `mlp_hidden`. Attention saves the tokens; its skip reuses them. The MLP’s first GEMM saves the attention output; its skip reuses that. `tokens` must be at most 64, because the forward kernel keeps one softmax row in a fixed array.
+* `Program::transformer_block(batch, tokens, dim, mlp_hidden)` — residual self-attention, then a residual MLP of width `mlp_hidden`. Attention saves the tokens; its skip reuses them. The MLP’s first GEMM saves the attention output; its skip reuses that. The softmax row is streamed, so the token count is whatever fits in a 64-bit length.
 
 Attention, with `scale = 1/√dim`:
 
@@ -323,7 +323,7 @@ Per layer, the residual holds:
 | router probabilities over every expert, top-k indices, the probabilities before renormalization, the mixture weights | router Jacobian |
 | gate and up projections | SwiGLU backward |
 
-The CPU tape stores gate and up for the selected slots only. The CUDA tape stores them for every expert and multiplies an unselected expert's outgoing cotangent by zero. Those two adjoints agree. Weights stay in the parameter buffer. SwiGLU hidden states and the RoPE angles are recomputed on the way back. Sequence length is at most 64, because one softmax row sits in a fixed array.
+The CPU tape stores gate and up for the selected slots only. The CUDA tape stores them for every expert, and an unselected expert's outgoing cotangent is zero. Those two adjoints agree. Weights stay in the parameter buffer. The runner also keeps each layer's weighted norm outputs and the attention mixture, because a later norm overwrites the live activation. RoPE angles are recomputed from the pre-RoPE queries and keys. Attention scores are streamed, so the sequence length is a 64-bit count.
 
 Backward order is the language-model head, the final RMSNorm, the layers from last to first, then a scatter-add into the embedding rows. Inside a layer: expert SwiGLU and the router, the feed-forward RMSNorm, the skip around the mixture, `Wo`, grouped-query attention, the RoPE adjoint, `Wq`/`Wk`/`Wv`, the attention RMSNorm, and the skip around attention. Both branches of a residual receive the cotangent of the sum. Token ids are data, not parameters.
 
@@ -331,15 +331,125 @@ Backward order is the language-model head, the final RMSNorm, the layers from la
 
 `forward_backward` returns the loss, the full parameter gradient, and the logits. `sgd_step` replaces `p` with `p − lr · ∇p` and returns the Euclidean norm of the gradient. The demo step uses `DEMO_LR` (`0.05`).
 
-`emit_cuda` fills `src/mixtral_kernels.cu.tpl` from `layout`. `kernel::nvcc_run` compiles and runs that source:
+`emit_cuda(cfg, batch, seq, probes, cluster)` fills `src/staged_mixtral.cu.tpl` from `compile_mixtral`. The generated `STEPS` table is the stage plan: device, parameter home, pass, operation, parameter offset, and tile bounds. `kernel::nvcc_run` compiles and runs that source:
 
 ```text
-/usr/local/cuda/bin/nvcc -arch=sm_75 -ccbin g++-11 -O2 mixtral_demo.cu -o mixtral_demo
+/usr/local/cuda/bin/nvcc -arch=sm_75 -ccbin g++-11 -O2 mixtral_staged.cu -o mixtral_staged
 ```
 
-The binary prints `PCOUNT`, `LOSS0` (loss before the step), `LSUM` (sum of logits), `WSUM` (sum of mixture weights), `GSUM` and `GABS` (sum and absolute sum of the parameter gradient), `GNORM`, one `IDX` line of expert choices, one `GRAD` line per probe, one `EMASS` line per expert (selection count and absolute gradient mass of that expert's three matrices, summed over layers), and `LOSS1` after the step. `nvidia_mixtral_matches_the_adjoint` compares each of those to the Rust lens, with the same absolute tolerance the other kernels use (`1e-3 + 1e-3 |expected|`), and checks that the loss went down. Routing indices match exactly. An expert with a zero selection count has gradient mass under `1e-4` on the device.
+A GPU step launches the kernels for that window and copies the tile from its home. A CPU step runs the same operation in the host interpreter. SGD is one step per parameter home, on the device that stores the home, and updates that rectangle with `p -= lr * dp`. The binary prints `PCOUNT`, `LOSS0`, `LOSS1`, `GSUM`, `GABS`, `GNORM`, `GPUOPS`, `CPUOPS`, `XFERS`, and one `GRAD` line per probe. `nvidia_mixtral_matches_the_adjoint` compares the loss, the gradient sum, the absolute sum, the Euclidean norm, and the probe gradients to the Rust lens, with tolerance `1e-3 + 1e-3 |expected|`, and checks that the loss went down. The test cluster is a 64 MiB CPU, which holds the parameter homes and applies SGD, and a 16 KiB GPU, which runs the tiled windows. `GPUOPS` and `XFERS` are both positive.
 
 Finite differences of the demo, step `1e-3`, accept absolute error below `2e-2` on eight parameters: an embedding row, the first layer's attention norm, query, and output projection, a selected gate and down matrix, the final norm, and the language-model head.
+
+## Compiler specification
+
+A compiled model is a schedule. The schedule is code memory: kernel text plus an ordered list of launches. Every value a launch reads or writes is buffer memory. A launch is legal when each slice it names is resident on the device that runs it, that device's buffer can hold the resident bytes, and each kernel phase fits that device's code budget. Weights and their adjoint updates are slices of two buffers, so a stage can run while the rest of the model stays outside the working set. [`cluster`](src/cluster.rs) is the pass that places those slices on a heterogeneous cluster.
+
+### Code memory
+
+Code memory has two regions.
+
+**Kernel text.** Device functions. The small compiler emits, per `Gemm` stage, `fwd_gemm`, `bwd_relu`, `bwd_dx`, `bwd_dw`, `bwd_db`, and `add_skip`, and per `Attention` stage `fwd_attn` and `bwd_attn`. An `Add` emits `add_fwd`. The Mixtral compiler emits one copy of each kind: `k_embed`, `k_embed_bwd`, `k_rmsnorm`, `k_rmsnorm_bwd`, `k_rmsnorm_dw`, `k_lin_y`, `k_lin_dx`, `k_lin_dw`, `k_add`, `k_zero`, `k_rope`, `k_gqa_fwd`, `k_gqa_bwd`, `k_router`, `k_silu_fwd`, `k_silu_bwd`, `k_mix_fwd`, `k_mix_bwd`, `k_loss`, `k_sgd`. The router Jacobian is `k_mix_bwd`. A block is 128 threads. The grid is `(n + 127) / 128` blocks. CUDA allows `2^31 - 1` blocks in one launch, so a longer buffer is issued as successive chunks of that many blocks. The thread index is `base + blockIdx.x * blockDim.x + threadIdx.x`, with `base` a 64-bit element offset.
+
+**The schedule.** Host instructions. For Mixtral each entry is one staged window: the device, the parameter home, the pass, the operation, the parameter offset, and the batch, row, and column bounds. The layer and expert order is the order of those windows. Launches run one at a time on the default CUDA stream. Two launches may be reordered or overlapped only when no write slice of either meets a read or write slice of the other. Atomic updates of one slice (below) stay in the order written in the schedule.
+
+Weights, activations, residuals, and adjoints are not kernel text. `mixtral::emit_cuda` fills `P` at runtime with `init_params` and `init_router`. `kernel::emit_cuda` additionally copies the parameter buffer and the expected Rust results into the translation unit so the binary can check itself; those arrays initialize buffers, and the kernels still receive them as pointers.
+
+### Buffer memory
+
+A buffer is an element type, a length in elements, and a base address. A slice is `(buffer, offset, length)` with `offset + length ≤ buffer.length`. A kernel pointer is `base + offset`. Lengths and offsets are `u64`. `mixtral::emit_cuda` accepts every positive shape, including `MixtralConfig::mixtral_8x7b` at about 46.7 billion parameters, and `nvcc_compile` compiles that schedule. The published binary is compiled and not executed. Executing it would allocate the host parameter and adjoint vectors; each GPU launch allocates the window's tile. The caller supplies the cluster budgets that choose those tiles.
+
+| Buffer | Element | Length | Who writes it | Who reads it |
+|---|---|---|---|---|
+| `P` | `f32` | parameter count, in the layout above | `k_sgd` after the adjoint is finished | forward kernels, and backward kernels that still need the weights (`bwd_dx`, `k_linear_dx`, RMSNorm backward, router backward) |
+| `dP` | `f32` | the same layout as `P` | adjoint kernels, after a zeroing of the whole buffer | `k_sgd` |
+| residual `f32` | `f32` | `tape_f32`, or the Mixtral residual below | the forward launch that saves it | the backward launch of that same stage |
+| residual mask | `u8` | `tape_u8` | `fwd_gemm` when ReLU is on | `bwd_relu` |
+| side | `f32` | `tape_f32`, zeroed before backward | backward of an `Add`, at offset `from` | backward of the stage that saved that offset, added into `dX` |
+| activation pair | `f32` | the longest activation in the program | the stage that produces it | the next stage. The two buffers alternate |
+| tokens, targets | `i32` | `batch * seq` | the caller | embedding and the loss |
+| loss | `f32` | 1 | `k_ce`, by atomic add | the host |
+
+`P` and `dP` use the same offsets. A GEMM or Mixtral linear map occupies `din * dout` floats at its offset, then a bias of `dout` floats when the stage has one. Mixtral has no biases. An assigning writer (`bwd_dw`, `bwd_db`, `k_linear_dw`) is the only writer of its slice and stores the full gradient. An atomic writer is the only writer of its slice, runs after the zeroing, and adds. The atomic writers are the embedding rows, an RMSNorm weight, the router, and the grouped-query `dk` and `dv` across heads that share a key/value head.
+
+### Small-program schedule
+
+Forward follows `Program.stages`. Backward is that list reversed. Before backward, `dP` and the side buffer are zero, and the output cotangent is 1 in every coordinate (the sum loss).
+
+| Launch | Reads | Writes |
+|---|---|---|
+| GEMM forward | activation, `P` weights, `P` bias | residual copy of the activation; ReLU mask when enabled; next activation |
+| Attention forward | activation | residual copy of the tokens; residual softmax rows; next activation |
+| Add forward | residual at `from` | current activation, by adding the residual into it |
+| GEMM backward | output cotangent, residual activation, ReLU mask, `P` weights, side at the save | `dP` weights, `dP` bias, next cotangent (weight adjoint plus the side buffer) |
+| Attention backward | output cotangent, residual tokens, residual probabilities, side at the token save | next cotangent |
+| Add backward | output cotangent | side buffer at `from`, by adding the cotangent into it |
+
+The reversed order puts each Add's backward before the backward of the stage that owns `from`, so the side slot is full when that stage adds it into `dX`.
+
+### Mixtral schedule
+
+Forward is embedding, then each layer, then the final norm and the language-model head, then `k_ce`. Backward is the head, the final norm, the layers from last to first, the embedding scatter, then `k_sgd`. Inside a layer the forward order is attention norm, `Wq`/`Wk`/`Wv`, RoPE, grouped-query attention, `Wo`, the attention residual, feed-forward norm, router, every expert's gate, up, SwiGLU, and down, then the mixture residual. The backward order is the experts and the router, the feed-forward norm, the mixture skip, `Wo`, grouped-query attention, the RoPE adjoint, `Wq`/`Wk`/`Wv`, the attention norm, and the attention skip.
+
+Residual slots for one layer, with `N = batch * seq`. The CUDA schedule stores gate and up for every expert. The CPU tape stores them for the selected slots only (`N * top_k * intermediate` instead of `experts * N * intermediate`).
+
+| Slot | Elements |
+|---|---|
+| stream into attention, stream into the feed-forward | `N * dim` each |
+| attention and feed-forward `rsqrt` | `N` each |
+| pre-RoPE queries, attention mixture | `N * heads * head_dim` each |
+| pre-RoPE keys, values | `N * kv_heads * head_dim` each |
+| attention probabilities | `batch * heads * seq * seq` |
+| router probabilities | `N * experts` |
+| top-k indices (`u64`), pre-renorm probabilities, mixture weights | `N * top_k` each |
+| gate and up, all experts | `experts * N * intermediate` each |
+
+The final norm adds one more stream of `N * dim` and one `rsqrt` of `N`. Across `L` layers the residual is `L` copies of the table.
+
+Scratch is reused across layers. These aliases are part of the schedule; a reordering has to keep the same live ranges.
+
+| Scratch | Holds | Until |
+|---|---|---|
+| stream `x` | layer input, then the layer cotangent | the attention-norm backward overwrites it with the incoming cotangent |
+| `xn` | weighted feed-forward norm | expert and router adjoints have read it; attention backward then reuses it for the weighted attention norm |
+| expert outputs | one vector per expert per token | the router adjoint has dotted them with the layer cotangent |
+| `attn` | feed-forward-norm adjoint plus the mixture skip | the attention skip has added it into the incoming cotangent |
+| `d_xn` | sum of expert and router input adjoints, later the sum of the `Wq`/`Wk`/`Wv` input adjoints | the matching RMSNorm backward reads it |
+| pre-RoPE copies | queries, keys, values | RoPE has rebuilt the forward values and the attention adjoint has consumed them |
+
+One layer's launches name that layer's slices of `P` and `dP`, that layer's residual slots, and the scratch. The other layers' weights are not in the working set. One published layer is this many floats of `P`:
+
+```text
+dim
++ dim * (heads * head_dim)
++ 2 * dim * (kv_heads * head_dim)
++ (heads * head_dim) * dim
++ dim
++ dim * experts
++ experts * (2 * dim * intermediate + intermediate * dim)
+```
+
+For the published shape that is 1,451,270,144 floats, about 5.41 GiB. The staged plan keeps that layer's parameters at their homes and moves one tile at a time. The adjoint of a tile is added into `dP` while the tile is resident.
+
+`k_sgd` is the last group of windows, one per parameter home. It reads that home's `dP` rectangle and writes `P[i] ← P[i] − lr · dP[i]` on the device that stores the home. The demo passes `lr = 0.05`.
+
+### Cluster staging
+
+A cluster is a list of devices. Each device is a CPU or a GPU, with `buffer_bytes` for parameters, tapes, and scratch, and `code_bytes` for the kernels resident at one time. `compile_mixtral` and `compile_program` turn a model into a `StagePlan`.
+
+Homes come first. Parameter rectangles are packed into buffer memory, CPUs first, splitting a matrix by rows and then by columns until each piece fits a device. The plan covers every parameter element once. A cluster whose buffers sum to less than the parameter bytes cannot hold the model; that is the capacity check, and it is independent of the model shape.
+
+Tapes are homes too. Every Mixtral layer tape (the residual in the table above, including every expert's gate and up projections and the attention probabilities) is reserved while the windows are placed, then released, so the returned homes are the parameters. Peak buffer use during placement includes those tapes. A `Program` keeps its whole tape resident, because a skip reads an earlier save.
+
+A window is one tiled launch. Its resident bytes are the homes already on that device, the parameter tile, the tape slice the tile reads, the activations, and the adjoint tile. The adjoint is applied while the tile is resident, so the schedule does not have to allocate a second full copy of `P`.
+
+The compiler derives the fabric with `derive_links`. CPUs are connected to each other. Each GPU is attached to one CPU, and GPUs attached to the same CPU are connected to each other. With no CPU, the GPUs form a peer fabric. `Cluster::linked` replaces that fabric with an explicit one. `route_message` then chooses the shortest path for each message. An intermediate device is usable when its free buffer holds the message. A direct link has no intermediate, so the endpoints' own homes do not have to leave extra room.
+
+Those routes become the message schedule. Before a window, inbound hops deliver the parameter rectangle and the activation tensor to the device that will run it. After a backward window, outbound hops return the adjoint rectangle to the parameter home and the activation tensor to the device that keeps it between windows. SGD runs at the home when that device can load `k_sgd`. When it cannot, the rectangle and its adjoint move to a device that can, the update runs there, and the updated rectangle comes back. The emitted program performs each hop with a copy along that link, then runs the window. Forward, adjoint, and update therefore stay in one sequence, and the only extra requirement is that every tile fits a device and every message has a route.
+
+The tile shrinks the batch, the contraction, and the output until some device can hold the footprint and can load the kernels. A GPU loads CUDA kernels in phases: a phase is a subset whose code sizes sum to at most `code_bytes`. Each kernel is `KERNEL_CODE_BYTES` (8 KiB) in this model. A CPU runs the interpreter when its code budget covers `CPU_RUNTIME_BYTES` (64 KiB). GPU windows are preferred when both kinds fit. A GPU whose code budget holds only a few kernels still runs the tile, one phase at a time, with the buffers left in place.
+
+`compile_mixtral(&MixtralConfig::mixtral_8x7b(), 1, 1, cluster)` is the published model on a chosen cluster. On a host with 256 GiB of buffer and a GPU with 6 GiB of buffer and 8 KiB of code, the parameter homes sit on the CPU and the GPU computes the tiles, loading kernels in more than one phase. `emit_cuda` on that cluster is what `published_mixtral_compiles_at_full_parameter_count` compiles. `emit_cuda` runs every window in that order, with the routed hops before and after it. GPU windows launch their kernels, and CPU windows run the host interpreter. The demo adjoint test uses a 64 MiB CPU for the homes and SGD and a 16 KiB GPU for the tiled compute. Two GPUs that each hold about half of the demo split the parameter homes, and each home's SGD window runs on the GPU that stores it.
 
 ## Vector spaces over GF(2)
 
@@ -365,6 +475,7 @@ Finite differences of the demo, step `1e-3`, accept absolute error below `2e-2` 
 | `ad` | Section 3.1, scalar lenses |
 | `kernel` | Section 3.1, tensor lenses compiled to CUDA |
 | `mixtral` | Section 3.1, Mixtral 8x7B compiled to CUDA |
+| `cluster` | staging of parameter buffers and tapes under device code and buffer budgets |
 
 ## Tests
 
