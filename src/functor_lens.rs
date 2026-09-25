@@ -5,7 +5,7 @@
 //! `f: A → B` together with `A ×_B Y' → X'` over `A`. That is the dependent
 //! lens whose forward family is the identity `A → A`.
 
-use crate::dlens::{self, DLens};
+use crate::dlens::DLens;
 use crate::finset::{self, Mor};
 use crate::optic::Family;
 use crate::slice::{self, SliceObj};
@@ -57,6 +57,7 @@ pub fn from_base(dom: &SliceObj, cod: &SliceObj, base_map: &Mor, put: Mor) -> DL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dlens;
     use crate::finset::MAX_CARD;
     use crate::slice::objects_up_to;
 

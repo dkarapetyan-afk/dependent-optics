@@ -7,7 +7,7 @@
 //! matrix of positions, and matrix multiplication in [`crate::fibre`] reproduces
 //! composition of those residuals.
 
-use crate::fibre::{self, Matrix};
+use crate::fibre::Matrix;
 use crate::finset::{self, Mor};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -193,6 +193,7 @@ pub fn hom(dom: &Poly, cod: &Poly) -> Vec<PolyMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fibre;
 
     #[test]
     fn polynomial_maps_form_a_category_and_residuals_multiply() {

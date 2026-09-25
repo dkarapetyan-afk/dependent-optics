@@ -446,6 +446,7 @@ fn attention_backward(
     dx
 }
 
+#[cfg(test)]
 fn finite_difference(
     prog: &Program,
     x: &[f32],

@@ -10,10 +10,9 @@
 //! as `A/C(X, X' ⊗_B Y)`; the maps are module homomorphisms, the dual of
 //! `Comod_A(X ⊗_B Y', X')`.
 
-use crate::dlens::{self, DLens};
+use crate::dlens::DLens;
 use crate::finset::{self, Mor};
 use crate::monoid::{self, CMon, Module};
-use crate::optic::Family;
 
 /// The monoidal-lens normal form of a dependent lens, viewed through `⊗_B`.
 pub fn as_comodule_put(lens: &DLens) -> crate::slice::SliceObj {
@@ -122,8 +121,10 @@ pub fn prism_data(base_a: &CMon, base_b: &CMon, x: &Module, y: &Module) -> Vec<P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dlens;
     use crate::finset::MAX_CARD;
     use crate::monoid::monoids_up_to;
+    use crate::optic::Family;
 
     #[test]
     fn monoidal_lenses_match_dependent_lenses() {

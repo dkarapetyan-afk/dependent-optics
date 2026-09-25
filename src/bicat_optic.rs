@@ -6,10 +6,8 @@
 //! is the pullback of the apex maps, which is the pullback presentation of a
 //! composite residual.
 
-use crate::dlens::{self};
 use crate::finset::{self, Mor};
-use crate::optic;
-use crate::span::{self, Span, TwoCell};
+use crate::span::{Span, TwoCell};
 
 /// Paste 2-cells of composable spans. `outer` sits on the codomain side.
 pub fn paste(
@@ -47,6 +45,9 @@ pub fn paste(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dlens;
+    use crate::optic;
+    use crate::span;
 
     #[test]
     fn pi0_is_normal_form_equality() {

@@ -6,10 +6,11 @@
 //! maps. The cartesian strength on classical lenses is the non-dependent case
 //! of the same structure.
 
+#[cfg(test)]
 use crate::dlens::{self, DLens};
 use crate::finset::{self, Mor};
 use crate::mixed::{self, Lens};
-use crate::optic::{self, Family, Witness};
+use crate::optic::{Family, Witness};
 use crate::slice::{self, SliceMor};
 
 /// `ι_A(l, r) = ⟨θ ∘ l | r ∘ θ^{-1}⟩` on the identity span.
@@ -33,6 +34,7 @@ pub fn iota(l: &SliceMor, r: &SliceMor) -> Witness {
     }
 }
 
+#[cfg(test)]
 fn lens_after_domain(lens: &DLens, l: &SliceMor, r: &SliceMor) -> DLens {
     let get = finset::compose(&lens.get, &l.map);
     let x_to_b = finset::compose(&lens.cod.forward.leg, &get);
@@ -71,6 +73,7 @@ fn lens_after_domain(lens: &DLens, l: &SliceMor, r: &SliceMor) -> DLens {
     }
 }
 
+#[cfg(test)]
 fn lens_before_codomain(lens: &DLens, l: &SliceMor, r: &SliceMor) -> DLens {
     // l: Y → Z, r: Z' → Y'. Composite get is l ∘ get.
     // put uses r first: (x, z') ↦ put(x, r(z')).
@@ -168,6 +171,7 @@ pub fn strengthen(lens: &Lens, c: u32) -> Lens {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optic;
 
     #[test]
     fn lemma_2_and_proposition_6() {

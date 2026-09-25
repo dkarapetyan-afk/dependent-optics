@@ -5,8 +5,10 @@
 //! `2^{dim X · dim Y' · dim X' · dim Y}`. The coend over residuals of dimension
 //! at most 1 has the same number of equivalence classes.
 
+#[cfg(test)]
 use crate::vect::{self, Lin};
 
+#[cfg(test)]
 fn classes(dx: u32, dy: u32, dxp: u32, dyp: u32) -> usize {
     let mut kept: Vec<(u32, Lin, Lin)> = Vec::new();
     for dm in 0..=1 {

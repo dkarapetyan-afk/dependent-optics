@@ -1,4 +1,4 @@
-//! Run a [`StagePlan`](crate::cluster::StagePlan) as a distributed system.
+//! Run a [`StagePlan`] as a distributed system.
 //!
 //! A coordinator is the control plane. Each device is a member that connects
 //! to the coordinator over TCP and announces its name, kind, and budgets.

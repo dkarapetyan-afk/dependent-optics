@@ -8,9 +8,8 @@
 //! coproduct in the same way.
 
 use crate::comonoid::times;
-use crate::dlens::{self, DLens};
+use crate::dlens::DLens;
 use crate::finset::{self, Mor};
-use crate::functor_lens;
 use crate::optic::Family;
 use crate::slice::SliceObj;
 
@@ -94,6 +93,8 @@ fn product_put(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dlens;
+    use crate::functor_lens;
 
     #[test]
     fn lens_tensor_is_functorial_and_unital() {

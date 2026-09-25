@@ -1591,7 +1591,7 @@ fn bind_offsets(cfg: &MixtralConfig, matrices: &mut [Matrix]) {
     );
 }
 
-fn param_offset(cfg: &MixtralConfig, lay: &crate::mixtral::Layout, name: &str) -> usize {
+fn param_offset(_cfg: &MixtralConfig, lay: &crate::mixtral::Layout, name: &str) -> usize {
     if name == "embed" {
         return lay.embed;
     }
@@ -1623,7 +1623,6 @@ fn param_offset(cfg: &MixtralConfig, lay: &crate::mixtral::Layout, name: &str) -
             }
         }
     }
-    .saturating_add(0 * cfg.dim)
 }
 
 fn mixtral_matrices(cfg: &MixtralConfig, n: u64) -> Vec<Matrix> {

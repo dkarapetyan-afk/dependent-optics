@@ -2,7 +2,7 @@
 //!
 //! The modules follow the paper, then the constructions it cites:
 //!
-//! - [`finset`], [`span`], [`slice`] — finite sets, spans, and the slice indexed category
+//! - [`finset`], [`span`], [`mod@slice`] — finite sets, spans, and the slice indexed category
 //! - [`optic`], [`dlens`], [`dprism`] — Definition 1, dependent lenses (Definition 2), dependent prisms
 //! - [`functor_lens`], [`mixed`] — Propositions 2 and 1
 //! - [`monoid`], [`comonoid`], [`monoidal_optic`] — Sections 3.2 and 3.3

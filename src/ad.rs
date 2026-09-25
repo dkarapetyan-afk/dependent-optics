@@ -194,12 +194,14 @@ pub fn stored_scalars(tape: &Tape) -> Vec<Q> {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct Dual {
     re: Q,
     eps: Q,
 }
 
+#[cfg(test)]
 fn dual_eval(expr: &Expr, env: &[Dual]) -> Dual {
     match expr {
         Expr::Var(i) => env[*i],

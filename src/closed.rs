@@ -5,14 +5,14 @@
 //! `Y'_b → X'_a`. Equation (1) collapses to a single slice hom
 //! `X → (Y' ⊲ X') ×_B Y`.
 
-use crate::dlens::{self, DLens};
+use crate::dlens::DLens;
 use crate::finset::{self, Mor};
 use crate::optic::Family;
 use crate::slice::{self, SliceMor, SliceObj};
 
 /// An element of `Y' ⊲ X'`: a pair `(a, b)` and a table `fiber(Y', b) → fiber(X', a)`.
 #[derive(Clone, Debug)]
-struct Exponential {
+pub struct Exponential {
     /// Base `A × B`, index `a * b_card + b`.
     pub obj: SliceObj,
     pub a_card: u32,
@@ -27,7 +27,7 @@ fn fiber(leg: &Mor, p: u32) -> Vec<u32> {
     (0..leg.dom).filter(|&i| leg.apply(i) == p).collect()
 }
 
-fn exponential(y_prime: &SliceObj, x_prime: &SliceObj) -> Exponential {
+pub fn exponential(y_prime: &SliceObj, x_prime: &SliceObj) -> Exponential {
     let a_card = x_prime.base;
     let b_card = y_prime.base;
     let base = finset::product(a_card, b_card).obj;
@@ -88,7 +88,7 @@ fn exponential(y_prime: &SliceObj, x_prime: &SliceObj) -> Exponential {
 }
 
 /// Evaluation `(Y' ⊲ X') ×_B Y' → X'`.
-fn counit(exp: &Exponential) -> SliceMor {
+pub fn counit(exp: &Exponential) -> SliceMor {
     let to_b = Mor {
         dom: exp.obj.total,
         cod: exp.b_card,
@@ -330,6 +330,7 @@ pub fn to_lens(closed: &Closed) -> DLens {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dlens;
 
     #[test]
     fn closed_form_bijects_with_dependent_lenses() {

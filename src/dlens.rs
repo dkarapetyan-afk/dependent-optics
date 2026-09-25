@@ -11,9 +11,9 @@
 //! computed pointwise on the cospan.
 
 use crate::finset::{self, Mor};
-use crate::optic::{self, Family, Witness};
+use crate::optic::{Family, Witness};
 use crate::slice::{self, SliceMor, SliceObj};
-use crate::span::{self, Span};
+use crate::span::Span;
 
 /// Equation (5), one summand: a get of total spaces and a put over `A`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -432,6 +432,8 @@ pub fn copair(parts: &[Family], legs: &[DLens]) -> DLens {
 mod tests {
     use super::*;
     use crate::finset::MAX_CARD;
+    use crate::optic;
+    use crate::span;
 
     #[test]
     fn normalize_embed_roundtrip() {

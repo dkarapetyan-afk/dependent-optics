@@ -7,7 +7,6 @@
 //! [`crate::bimod`]; here composition of the closed linear maps is checked
 //! to be bilinear on dimensions at most 1.
 
-use crate::bimod::closed_dimension;
 use crate::vect::{self, Lin};
 
 /// A closed tensor-optic `X → [Y', X'] ⊗ Y`, stored as a linear map into the
@@ -27,6 +26,7 @@ pub fn compose_closed(g: &Lin, f: &Lin) -> Lin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bimod::closed_dimension;
 
     #[test]
     fn closed_composition_is_linear() {
