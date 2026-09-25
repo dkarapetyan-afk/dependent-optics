@@ -907,6 +907,8 @@ fn nvcc_compile_bin(src: &str, name: &str) -> Result<std::path::PathBuf, String>
             "-ccbin",
             "g++-11",
             "-O2",
+            "-Xcompiler",
+            "-pthread",
             cu.to_str().unwrap(),
             "-o",
             bin.to_str().unwrap(),

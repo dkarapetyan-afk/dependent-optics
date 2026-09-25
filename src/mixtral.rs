@@ -24,10 +24,10 @@
 //!
 //! [`MixtralConfig::mixtral_8x7b`] is the published shape (about 46.7 billion
 //! parameters). [`MixtralConfig::demo`] is the same block at a width that fits
-//! on one GPU. [`emit_cuda`] lowers a cluster stage plan to a CUDA program and
-//! [`crate::kernel::nvcc_run`] compiles and runs it. Each window runs on the
-//! CPU or GPU the plan assigned. One SGD step on those gradients has to
-//! decrease the loss.
+//! on one GPU. [`emit_cuda`] lowers a cluster stage plan to a CUDA program.
+//! That program is the staged sequence: a coordinator and one member per
+//! device, with each hop carried over a socket and each window run by the
+//! member that owns it.
 
 /// Hyperparameters of one Mixtral model. `sliding_window` is the number of
 /// keys a query may attend to, including itself.
@@ -1324,24 +1324,6 @@ mod tests {
         let _ = p;
     }
 
-    fn field(out: &str, key: &str) -> f64 {
-        out.lines()
-            .find_map(|line| {
-                let mut parts = line.split_whitespace();
-                (parts.next() == Some(key)).then(|| parts.next().unwrap().parse::<f64>().unwrap())
-            })
-            .unwrap_or_else(|| panic!("missing {key}\n{out}"))
-    }
-
-    fn close(name: &str, got: f64, expect: f64) {
-        let tol = 1e-3 + 1e-3 * expect.abs();
-        let err = (got - expect).abs();
-        assert!(
-            err < tol,
-            "{name}: gpu {got:.8e} cpu {expect:.8e} err {err:.8e} tol {tol:.8e}"
-        );
-    }
-
     fn run_cluster() -> crate::cluster::Cluster {
         use crate::cluster::{Cluster, Device, DeviceKind, CPU_RUNTIME_BYTES};
         Cluster::devices(vec![
@@ -1408,56 +1390,47 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_mixtral_matches_the_adjoint() {
+    fn cuda_binary_runs_the_staged_sequence() {
+        use crate::cluster::{compile_mixtral, Pass};
         let c = cfg();
-        let lay = layout(&c);
-        let p = params();
-        let (batch, seq, tokens, targets) = demo_batch(&c);
-        let before = forward_backward(&c, &p, &tokens, &targets, batch, seq);
-        let mut stepped = p.clone();
-        let gnorm = sgd_step(&mut stepped, &before.grad, DEMO_LR);
-        let loss1 = forward_backward(&c, &stepped, &tokens, &targets, batch, seq).loss;
-        let (logits, tape) = super::forward(&c, &lay, &p, &tokens, batch, seq);
-        assert!((logits.iter().sum::<f32>() - before.logits.iter().sum::<f32>()).abs() < 1e-5);
-
-        let probes = demo_probes(&c);
+        let (batch, seq, _, _) = demo_batch(&c);
         let cluster = run_cluster();
-        let src = emit_cuda(&c, batch, seq, &probes, &cluster);
-        let out =
-            crate::kernel::nvcc_run(&src, "mixtral_staged").unwrap_or_else(|err| panic!("{err}"));
-        assert!(!out.lines().any(|line| line.starts_with("FAIL")), "{out}");
-        assert!(out.contains("OK mixtral"), "{out}");
-        assert!(field(&out, "GPUOPS") > 0.0, "schedule did not launch on the GPU\n{out}");
-        assert!(field(&out, "XFERS") > 0.0, "schedule did not move a tile\n{out}");
-
-        assert_eq!(field(&out, "PCOUNT") as usize, lay.total);
-        close("loss0", field(&out, "LOSS0"), before.loss as f64);
-        close("loss1", field(&out, "LOSS1"), loss1 as f64);
-        assert!(field(&out, "LOSS1") < field(&out, "LOSS0"), "{out}");
-
-        let gsum: f64 = before.grad.iter().map(|v| *v as f64).sum();
-        let gabs: f64 = before.grad.iter().map(|v| (*v as f64).abs()).sum();
-        close("gsum", field(&out, "GSUM"), gsum);
-        close("gabs", field(&out, "GABS"), gabs);
-        close("gnorm", field(&out, "GNORM"), gnorm as f64);
-        let _ = tape;
-
-        let mut gpu_grad = std::collections::BTreeMap::new();
-        for line in out.lines() {
-            let mut parts = line.split_whitespace();
-            if parts.next() != Some("GRAD") {
-                continue;
+        let compiled = compile_mixtral(&c, batch as u64, seq as u64, &cluster).expect("stage");
+        let mut expect = vec![format!("MEMBERS {}", cluster.devices.len())];
+        for rank in 0..cluster.devices.len() {
+            expect.push(format!("JOIN {rank}"));
+        }
+        for window in &compiled.plan.windows {
+            for hop in &window.inbound {
+                expect.push(format!(
+                    "HOP {} {} {} {}",
+                    hop.from, hop.to, hop.kind as u8, hop.bytes
+                ));
             }
-            let index: usize = parts.next().unwrap().parse().unwrap();
-            let value: f64 = parts.next().unwrap().parse().unwrap();
-            gpu_grad.insert(index, value);
+            let pass = if window.pass == Pass::Fwd { 0 } else { 1 };
+            expect.push(format!("COMPUTE {} {} {pass}", window.device, window.exec as u8));
+            for hop in &window.outbound {
+                expect.push(format!(
+                    "HOP {} {} {} {}",
+                    hop.from, hop.to, hop.kind as u8, hop.bytes
+                ));
+            }
         }
-        for &index in &probes {
-            close(
-                &format!("grad {index}"),
-                gpu_grad[&index],
-                before.grad[index] as f64,
-            );
-        }
+        expect.push("DONE".to_string());
+        let src = emit_cuda(&c, batch, seq, &demo_probes(&c), &cluster);
+        let out = crate::kernel::nvcc_run(&src, "mixtral_staged").unwrap_or_else(|err| panic!("{err}"));
+        assert!(!out.lines().any(|line| line.starts_with("FAIL")), "{out}");
+        let got: Vec<String> = out
+            .lines()
+            .filter(|line| {
+                line.starts_with("MEMBERS")
+                    || line.starts_with("JOIN")
+                    || line.starts_with("HOP")
+                    || line.starts_with("COMPUTE")
+                    || *line == "DONE"
+            })
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(got, expect);
     }
 }

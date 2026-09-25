@@ -7,8 +7,8 @@
 //! budget. Windows tile the batch, the contraction, and the output until
 //! that is true. The adjoint of a tile is applied while the tile is
 //! resident, so the full adjoint buffer does not have to sit next to the
-//! parameters. `mixtral::emit_cuda` runs the resulting windows on those
-//! devices.
+//! parameters. [`crate::dist::run`] admits one member per device and runs the
+//! windows, with the hops carried as messages between members.
 
 use std::collections::VecDeque;
 
@@ -217,7 +217,7 @@ pub enum Exec {
     Sgd = 13,
 }
 
-/// One tiled piece of work. The CUDA emitter runs these in order on `device`.
+/// One tiled piece of work. [`crate::dist::run`] runs these in order on `device`.
 #[derive(Clone, Debug)]
 pub struct Window {
     pub name: String,

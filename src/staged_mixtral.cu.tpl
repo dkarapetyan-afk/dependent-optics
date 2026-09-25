@@ -1,13 +1,21 @@
-// Executes a staged Mixtral schedule. Each step runs on the device the plan
-// chose. A GPU step launches the kernels for that window and copies its tile.
-// Parameter homes stay where the plan put them; SGD updates each home there.
+// Runs a staged Mixtral schedule as a cluster. The main thread is the
+// coordinator. Each device is a member. Members pass parameter, adjoint, and
+// activation tiles to each other over TCP, then the member that owns a window
+// runs that operation.
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 using ull = unsigned long long;
 
@@ -59,7 +67,8 @@ const Step STEPS[] = { @@STEPS@@ };
 const int NSTEPS = sizeof(STEPS) / sizeof(STEPS[0]);
 
 int gpu_ops = 0, cpu_ops = 0, xfers = 0;
-int phys[256];
+int phys[NDEV];
+std::vector<int> g_peer;
 
 void must(const char* what) {
     cudaError_t e = cudaGetLastError();
@@ -1219,56 +1228,99 @@ void sgd_home(State& st, const Step& s, bool gpu) {
             st.P[(size_t)(s.p_off + (s.r0 + r) * s.dout + s.c0 + c)] = tile[(size_t)(r * cols + c)];
 }
 
-void relay(State& st, const Step& s) {
-    if (s.home < 0 || s.home >= NDEV) { printf("FAIL hop %d\n", s.home); exit(1); }
-    int kind = s.layer;
+std::mutex state_mu;
+State g_state;
+
+void io_full(int fd, void* buf, size_t n, bool writing) {
+    char* p = static_cast<char*>(buf);
+    while (n) {
+        ssize_t k = writing ? ::send(fd, p, n, MSG_NOSIGNAL) : ::recv(fd, p, n, 0);
+        if (k <= 0) { printf("FAIL socket\n"); exit(1); }
+        p += k;
+        n -= (size_t)k;
+    }
+}
+
+std::vector<float> pack_tile(State& st, const Step& s) {
     std::vector<float> tile;
-    ull rows = s.r1 > s.r0 ? s.r1 - s.r0 : 0;
-    ull cols = s.c1 > s.c0 ? s.c1 - s.c0 : 0;
-    if (kind == 2) {
+    if (s.layer == 2) {
         ull n = s.b0;
         if (n > st.x.size()) n = (ull)st.x.size();
         tile.assign(st.x.begin(), st.x.begin() + (size_t)n);
-    } else {
-        tile.resize((size_t)(rows * cols));
-        const std::vector<float>& buf = kind == 1 ? st.dP : st.P;
-        for (ull r = 0; r < rows; ++r)
-            for (ull c = 0; c < cols; ++c) {
-                ull i = s.p_off + (s.r0 + r) * s.dout + s.c0 + c;
-                tile[(size_t)(r * cols + c)] = i < buf.size() ? buf[(size_t)i] : 0.f;
-            }
+        return tile;
     }
-    auto touch = [&](int dev) {
-        if (dev < 0 || dev >= NDEV || DEV_KIND[dev] != 1 || tile.empty()) return;
-        cudaSetDevice(phys[dev]);
-        float* d = dev_f(tile.size());
-        h2d(d, tile.data(), tile.size() * 4);
-        d2h(tile.data(), d, tile.size() * 4);
-        cudaFree(d);
-    };
-    touch(s.home);
-    if (s.dev != s.home) touch(s.dev);
-    if (DEV_KIND[s.home] != 1 && DEV_KIND[s.dev] != 1) {
-        std::vector<float> transit = tile;
-        tile.swap(transit);
-        xfers++;
-        cpu_ops++;
+    ull rows = s.r1 > s.r0 ? s.r1 - s.r0 : 0;
+    ull cols = s.c1 > s.c0 ? s.c1 - s.c0 : 0;
+    tile.resize((size_t)(rows * cols));
+    const std::vector<float>& buf = s.layer == 1 ? st.dP : st.P;
+    for (ull r = 0; r < rows; ++r)
+        for (ull c = 0; c < cols; ++c) {
+            ull i = s.p_off + (s.r0 + r) * s.dout + s.c0 + c;
+            tile[(size_t)(r * cols + c)] = i < buf.size() ? buf[(size_t)i] : 0.f;
+        }
+    return tile;
+}
+
+void apply_tile(State& st, const Step& s, const std::vector<float>& tile) {
+    if (s.layer == 2) {
+        for (size_t i = 0; i < tile.size() && i < st.x.size(); ++i) st.x[i] = tile[i];
+        return;
     }
-    if (kind == 2) {
-        for (size_t i = 0; i < tile.size(); ++i) st.x[i] = tile[i];
-    } else {
-        std::vector<float>& buf = kind == 1 ? st.dP : st.P;
-        for (ull r = 0; r < rows; ++r)
-            for (ull c = 0; c < cols; ++c) {
-                ull i = s.p_off + (s.r0 + r) * s.dout + s.c0 + c;
-                if (i < buf.size()) buf[(size_t)i] = tile[(size_t)(r * cols + c)];
-            }
+    ull rows = s.r1 > s.r0 ? s.r1 - s.r0 : 0;
+    ull cols = s.c1 > s.c0 ? s.c1 - s.c0 : 0;
+    std::vector<float>& buf = s.layer == 1 ? st.dP : st.P;
+    for (ull r = 0; r < rows && (size_t)(r * cols) < tile.size(); ++r)
+        for (ull c = 0; c < cols; ++c) {
+            ull i = s.p_off + (s.r0 + r) * s.dout + s.c0 + c;
+            size_t at = (size_t)(r * cols + c);
+            if (i < buf.size() && at < tile.size()) buf[(size_t)i] = tile[at];
+        }
+}
+
+void write_tile(int fd, const std::vector<float>& tile) {
+    uint32_t n = (uint32_t)tile.size();
+    io_full(fd, &n, 4, true);
+    if (n) io_full(fd, (void*)tile.data(), (size_t)n * 4, true);
+}
+
+std::vector<float> read_tile(int fd) {
+    uint32_t n = 0;
+    io_full(fd, &n, 4, false);
+    std::vector<float> tile(n);
+    if (n) io_full(fd, tile.data(), (size_t)n * 4, false);
+    return tile;
+}
+
+int peer_fd(int rank, int other) {
+    return g_peer[(size_t)rank * (size_t)NDEV + (size_t)other];
+}
+
+void set_peer_fd(int rank, int other, int fd) {
+    g_peer[(size_t)rank * (size_t)NDEV + (size_t)other] = fd;
+}
+
+int listen_ephemeral(int& port, int backlog) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("FAIL socket\n"); exit(1); }
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (backlog < 1) backlog = 1;
+    if (bind(fd, (sockaddr*)&addr, sizeof(addr)) < 0 || listen(fd, backlog) < 0) {
+        printf("FAIL bind\n"); exit(1);
     }
+    socklen_t len = sizeof(addr);
+    getsockname(fd, (sockaddr*)&addr, &len);
+    port = ntohs(addr.sin_port);
+    return fd;
 }
 
 void run_step(State& st, const Step& s) {
     if (s.dev < 0 || s.dev >= NDEV) { printf("FAIL device %d\n", s.dev); exit(1); }
-    if (s.exec == Send) { relay(st, s); return; }
+    if (s.exec == Send) { printf("FAIL send is a member message\n"); exit(1); }
     bool gpu = DEV_KIND[s.dev] == 1;
     switch (s.exec) {
     case Embed:
@@ -1323,9 +1375,92 @@ void run_step(State& st, const Step& s) {
     }
 }
 
+enum CmdOp { Finish = 0, Compute = 1, SendTile = 2, RecvTile = 3, Ready = 4, Done = 5 };
+
+struct Cmd {
+    int op, step, other;
+};
+
+struct Boot {
+    int rank;
+    int coord_port;
+    int peer_port;
+    int peer_fd;
+};
+
+void member_loop(Boot boot) {
+    int ctrl = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)boot.coord_port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(ctrl, (sockaddr*)&addr, sizeof(addr)) < 0) { printf("FAIL connect\n"); exit(1); }
+    int hello[2] = { boot.rank, boot.peer_port };
+    io_full(ctrl, hello, sizeof(hello), true);
+    std::vector<int> ports(NDEV);
+    io_full(ctrl, ports.data(), ports.size() * sizeof(int), false);
+    for (int i = 0; i < boot.rank; ++i) {
+        sockaddr_in peer{};
+        socklen_t len = sizeof(peer);
+        int fd = accept(boot.peer_fd, (sockaddr*)&peer, &len);
+        if (fd < 0) { printf("FAIL accept\n"); exit(1); }
+        int other = 0;
+        io_full(fd, &other, sizeof(other), false);
+        set_peer_fd(boot.rank, other, fd);
+    }
+    for (int other = boot.rank + 1; other < NDEV; ++other) {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in peer{};
+        peer.sin_family = AF_INET;
+        peer.sin_port = htons((uint16_t)ports[other]);
+        peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(fd, (sockaddr*)&peer, sizeof(peer)) < 0) { printf("FAIL peer\n"); exit(1); }
+        int me = boot.rank;
+        io_full(fd, &me, sizeof(me), true);
+        set_peer_fd(boot.rank, other, fd);
+    }
+    int up = 1;
+    io_full(ctrl, &up, sizeof(up), true);
+    for (;;) {
+        Cmd cmd{};
+        io_full(ctrl, &cmd, sizeof(cmd), false);
+        if (cmd.op == Finish) break;
+        if (cmd.op == SendTile) {
+            std::vector<float> tile;
+            {
+                std::lock_guard<std::mutex> guard(state_mu);
+                tile = pack_tile(g_state, STEPS[cmd.step]);
+            }
+            write_tile(peer_fd(boot.rank, cmd.other), tile);
+        } else if (cmd.op == RecvTile) {
+            Cmd ready{ Ready, cmd.step, boot.rank };
+            io_full(ctrl, &ready, sizeof(ready), true);
+            std::vector<float> tile = read_tile(peer_fd(boot.rank, cmd.other));
+            std::lock_guard<std::mutex> guard(state_mu);
+            apply_tile(g_state, STEPS[cmd.step], tile);
+        } else if (cmd.op == Compute) {
+            std::lock_guard<std::mutex> guard(state_mu);
+            run_step(g_state, STEPS[cmd.step]);
+        } else {
+            printf("FAIL command %d\n", cmd.op);
+            exit(1);
+        }
+        if (cmd.op != RecvTile) {
+            Cmd done{ Done, cmd.step, boot.rank };
+            io_full(ctrl, &done, sizeof(done), true);
+        } else {
+            Cmd done{ Done, cmd.step, boot.rank };
+            io_full(ctrl, &done, sizeof(done), true);
+        }
+    }
+    ::close(ctrl);
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (NDEV > 256) { printf("FAIL device table\n"); return 1; }
+    const ull PROBES[] = { @@PROBES@@ };
+    if (sizeof(PROBES) == 0) { printf("FAIL device table\n"); return 1; }
+    g_peer.assign((size_t)NDEV * (size_t)NDEV, -1);
     int nd = 0;
     cudaGetDeviceCount(&nd);
     int seen = 0;
@@ -1336,45 +1471,79 @@ int main() {
             seen++;
         } else phys[i] = -1;
     }
-    State st;
-    alloc_state(st);
-    for (ull i = 0; i < P; ++i) st.P[(size_t)i] = 0.02f * ((i % 5ull) + 1.f);
+    int coord_port = 0;
+    int coord_fd = listen_ephemeral(coord_port, NDEV);
+    std::vector<int> peer_ports(NDEV);
+    std::vector<int> peer_fds(NDEV);
+    std::vector<std::thread> members;
+    for (int rank = 0; rank < NDEV; ++rank) {
+        peer_fds[rank] = listen_ephemeral(peer_ports[rank], rank < 1 ? 1 : rank);
+        Boot boot{ rank, coord_port, peer_ports[rank], peer_fds[rank] };
+        members.emplace_back(member_loop, boot);
+    }
+    std::vector<int> ctrl(NDEV, -1);
+    for (int n = 0; n < NDEV; ++n) {
+        int fd = accept(coord_fd, nullptr, nullptr);
+        if (fd < 0) { printf("FAIL accept\n"); return 1; }
+        int hello[2] = { 0, 0 };
+        io_full(fd, hello, sizeof(hello), false);
+        if (hello[0] < 0 || hello[0] >= NDEV || ctrl[hello[0]] >= 0) { printf("FAIL join\n"); return 1; }
+        ctrl[hello[0]] = fd;
+    }
+    printf("MEMBERS %d\n", NDEV);
+    for (int rank = 0; rank < NDEV; ++rank) printf("JOIN %d\n", rank);
+    for (int rank = 0; rank < NDEV; ++rank)
+        io_full(ctrl[rank], peer_ports.data(), peer_ports.size() * sizeof(int), true);
+    for (int rank = 0; rank < NDEV; ++rank) {
+        int up = 0;
+        io_full(ctrl[rank], &up, sizeof(up), false);
+        if (up != 1) { printf("FAIL peers\n"); return 1; }
+    }
+    {
+        std::lock_guard<std::mutex> guard(state_mu);
+        alloc_state(g_state);
+    }
+    for (ull i = 0; i < P; ++i) g_state.P[(size_t)i] = 0.02f * ((i % 5ull) + 1.f);
     for (ull li = 0; li < L; ++li)
         for (ull d = 0; d < D; ++d)
             for (ull e = 0; e < E; ++e)
-                st.P[(size_t)(ROUTER[li] + d * E + e)] = 0.05f * (e + 1.f) + 0.001f * (float)d;
+                g_state.P[(size_t)(ROUTER[li] + d * E + e)] = 0.05f * (e + 1.f) + 0.001f * (float)d;
     for (ull i = 0; i < N; ++i) {
-        st.tok[(size_t)i] = (i * 5ull + 1ull) % V;
-        st.tgt[(size_t)i] = (st.tok[(size_t)i] + 3ull) % V;
+        g_state.tok[(size_t)i] = (i * 5ull + 1ull) % V;
+        g_state.tgt[(size_t)i] = (g_state.tok[(size_t)i] + 3ull) % V;
     }
-    float loss0 = 0.f;
-    bool saw_loss = false;
     for (int i = 0; i < NSTEPS; ++i) {
-        run_step(st, STEPS[i]);
-        if (STEPS[i].exec == Loss && STEPS[i].pass == 0 && !saw_loss) {
-            loss0 = st.loss;
-            saw_loss = true;
+        const Step& s = STEPS[i];
+        if (s.exec == Send) {
+            printf("HOP %d %d %d %llu\n", s.home, s.dev, s.layer, s.b1);
+            Cmd recv{ RecvTile, i, s.home };
+            io_full(ctrl[s.dev], &recv, sizeof(recv), true);
+            Cmd ready{};
+            io_full(ctrl[s.dev], &ready, sizeof(ready), false);
+            if (ready.op != Ready) { printf("FAIL ready\n"); return 1; }
+            Cmd send{ SendTile, i, s.dev };
+            io_full(ctrl[s.home], &send, sizeof(send), true);
+            Cmd done_s{};
+            io_full(ctrl[s.home], &done_s, sizeof(done_s), false);
+            Cmd done_r{};
+            io_full(ctrl[s.dev], &done_r, sizeof(done_r), false);
+            if (done_s.op != Done || done_r.op != Done) { printf("FAIL hop ack\n"); return 1; }
+        } else {
+            printf("COMPUTE %d %d %d\n", s.dev, s.exec, s.pass);
+            Cmd cmd{ Compute, i, 0 };
+            io_full(ctrl[s.dev], &cmd, sizeof(cmd), true);
+            Cmd done{};
+            io_full(ctrl[s.dev], &done, sizeof(done), false);
+            if (done.op != Done) { printf("FAIL compute ack\n"); return 1; }
         }
     }
-    for (int i = 0; i < NSTEPS; ++i) {
-        if (STEPS[i].pass == 0 && STEPS[i].exec != Sgd) run_step(st, STEPS[i]);
+    for (int rank = 0; rank < NDEV; ++rank) {
+        Cmd cmd{ Finish, 0, 0 };
+        io_full(ctrl[rank], &cmd, sizeof(cmd), true);
+        ::close(ctrl[rank]);
     }
-    float loss1 = st.loss;
-    double gsum = 0, gabs = 0, g2 = 0;
-    for (float v : st.dP) { gsum += v; gabs += fabs(v); g2 += (double)v * v; }
-    printf("PCOUNT %llu\n", P);
-    printf("LOSS0 %.8e\n", loss0);
-    printf("LOSS1 %.8e\n", loss1);
-    printf("GSUM %.8e\n", gsum);
-    printf("GABS %.8e\n", gabs);
-    printf("GNORM %.8e\n", sqrt(g2));
-    printf("GPUOPS %d\n", gpu_ops);
-    printf("CPUOPS %d\n", cpu_ops);
-    printf("XFERS %d\n", xfers);
-    const ull PROBES[] = { @@PROBES@@ };
-    for (ull i = 0; i < sizeof(PROBES) / sizeof(PROBES[0]); ++i)
-        printf("GRAD %llu %.8e\n", PROBES[i], st.dP[(size_t)PROBES[i]]);
-    if (!std::isfinite(loss0) || !std::isfinite(loss1)) { printf("FAIL nonfinite\n"); return 1; }
-    printf("OK mixtral\n");
+    for (auto& member : members) member.join();
+    ::close(coord_fd);
+    printf("DONE\n");
     return 0;
 }
